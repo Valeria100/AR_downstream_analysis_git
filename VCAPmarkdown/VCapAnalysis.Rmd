@@ -1,0 +1,243 @@
+---
+title: "VCapAnalysis"
+author: "Valeria"
+date: "22 September 2016"
+output: pdf_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+## R Markdown
+
+This is an R Markdown document. Markdown is a simple formatting syntax for authoring HTML, PDF, and MS Word documents. For more details on using R Markdown see <http://rmarkdown.rstudio.com>.
+
+When you click the **Knit** button a document will be generated that includes both content as well as the output of any embedded R code chunks within the document. You can embed an R code chunk like this:
+
+```{r summary}
+load("summary.RData")
+```
+File has a double header. I contruct the correct column names.
+```{r header}
+cols <- c("Probes", rep("VCap",9), rep("LNCap",9), rep("VCap",2), rep("LNCap",2), rep("VCapLNCap",2))
+sum_col <- gsub("[.]","",as.character(t(summary[1,])))
+sum_col <- gsub(" ", "_", sum_col)
+sum_col <- gsub("[?]", "", sum_col)
+
+summary_colnames <- paste(cols, sum_col, sep=".")
+colnames(summary) <- summary_colnames
+
+```
+Shift the rownames to later avoid indeces problems.
+```{r}
+rownames(summary) <- c(0:(nrow(summary)-1))
+summary <- summary[-1,]
+```
+Create a file with only the probe type, id and corresponding hgnc symbol.
+```{r}
+probes <- summary[,c(1,2,10,11,19)]
+```
+Read sample files and assign it to the corresponding file names
+```{r}
+titles <- c("VCapAndrogen1","VCapAndrogen2","VCapControl1","VCapControl2",
+            "LNCapAndrogen1","LNCapAndrogen2","LNCapControl1","LNCapControl2")
+
+for(i in 1:length(titles)){
+  assign(titles[i],read.table(paste("massietimecourse/",titles[i],".csv",sep=""),header=TRUE,check.names=FALSE,sep=","))
+}
+```
+#As shown in summary file the last elements are LNCap Only and omitted in the VCap files.
+# To even the rows number of the files I add NAs.
+# Initially VCap files are 48802 long. After they are 56546 (same as LNCap files).
+```{r}
+even_rows <- function(Data, Probes){
+  matrix_na <- matrix(NA, length(which(Probes[,1]=="LNCap Only")), ncol(Data))
+  colnames(matrix_na) <- colnames(Data)
+  even_matrix <- rbind(Data, matrix_na)
+  return(even_matrix)
+}
+
+VCapAndrogen1 <- even_rows(VCapAndrogen1, probes)
+VCapAndrogen2 <- even_rows(VCapAndrogen2, probes)
+
+VCapControl1 <- even_rows(VCapControl1, probes)
+VCapControl2 <- even_rows(VCapControl2, probes)
+```
+Convert time in the column titles into numeric and store them in vectors
+```{r}
+time_titles <- c("time_VCapAndrogen1","time_VCapAndrogen2","time_VCapControl1","time_VCapControl2",
+                 "time_LNCapAndrogen1","time_LNCapAndrogen2","time_LNCapControl1","time_LNCapControl2")
+
+for(i in 1:length(time_titles)){
+  assign(time_titles[i],as.numeric(gsub("Time","",colnames(get(titles[i])))))
+}
+
+```
+Probes correspondence
+```{r probes_correspondence}
+library(DBI)
+library("illuminaHumanv3.db")
+ExpAnnotation_VCap<-illuminaHumanv3fullReannotation()
+
+annotation_vcap <- ExpAnnotation_VCap[which(ExpAnnotation_VCap$IlluminaID%in%probes$VCap.Probe_id),]
+AnnotationVCapAll <- annotation_vcap[order(match(annotation_vcap$IlluminaID,probes$VCap.Probe_id)),]
+```
+Select the genes that have a behavioural change that differs from natural fluctuation.
+Autocorrelation higher than 0 (a threshold) indicate a change in behaviour possibly caused by AR
+I calculate autocorrelation on each dataset and each repetition and then select the genes that pass the autocorrelation filter in both repetitions
+
+```{r autocorrelation}
+calculate_acf <- function(Data,ci){
+  acf_data <- NULL
+  for(i in 1:nrow(Data)){
+    if(all(is.na(Data[i,]))){
+      acf_data[i] <- NA
+    }else{
+      acf_data[i] <- acf(as.numeric(Data[i,]),type="correlation",lag.max=nrow(Data), plot=FALSE)$acf[2]
+    }
+  }
+  # Only the positive acf gets selected. when acf<0 is because the signal goes up and down.
+  acf_index <- which(acf_data>=ci)
+  acf_value <- acf_data[acf_index]
+  acf_Data <- cbind(acf_index,acf_value)
+  return(acf_Data)
+}
+# the qnorm... is how acf calculates the confidence intervals you can see in the plots.
+# I use it as threshold.
+VA1 <- calculate_acf(VCapAndrogen1,qnorm((1+0.95)/2)/sqrt(ncol(VCapAndrogen1)))
+VA2 <- calculate_acf(VCapAndrogen2,qnorm((1+0.95)/2)/sqrt(ncol(VCapAndrogen2)))
+
+VC1 <- calculate_acf(VCapControl1,qnorm((1+0.95)/2)/sqrt(ncol(VCapControl1)))
+VC2 <- calculate_acf(VCapControl2,qnorm((1+0.95)/2)/sqrt(ncol(VCapControl2)))
+
+# Select the genes that have been selected on both repetitions
+index_VCapAndrogen <- intersect(VA1[,1],VA2[,1]) 
+
+# Merge the indeces found in at least one repetition of Control.
+index_VCapControl <- sort(union(VC1[,1],VC2[,1]))
+
+# Compare these genes behaviour with the controls.
+# Select them only if the gene is in the case but not in the Control.
+index_VCap_Androgen_notControl <- sort(setdiff(index_VCapAndrogen,index_VCapControl))
+
+# probes_acf_VCap <- probes[index_VCap_Androgen_notControl,]
+
+```
+Calculate variance and F-test to compare the two populations 
+
+```{r}
+# Calculate variance for both androgens and controls. 
+apply_ftest <- function(a1, a2, c1, c2, ind){
+  var11 <- var12 <- var21 <- var22 <- NULL
+  for(i in 1:nrow(a1)){
+    var11[i] <- var.test(as.numeric(a1[i,]),as.numeric(c1[i,]))$p.value
+    var12[i] <- var.test(as.numeric(a1[i,]),as.numeric(c2[i,]))$p.value
+    var21[i] <- var.test(as.numeric(a2[i,]),as.numeric(c1[i,]))$p.value
+    var22[i] <- var.test(as.numeric(a2[i,]),as.numeric(c2[i,]))$p.value  
+  }
+  
+  #ind allow to refer the indeces to the original dataset
+  a <- ind[which(var11<=0.05)]
+  b <- ind[which(var12<=0.05)]
+  d <- ind[which(var21<=0.05)]
+  e <- ind[which(var22<=0.05)]
+  
+  ind_passed <- sort(unique(c(a,b,d,e)))
+  return(ind_passed)
+}
+
+#indeces are still based on the original datasets
+ind_acf_ftest_VCap <- apply_ftest(VCapAndrogen1[index_VCap_Androgen_notControl,], VCapAndrogen2[index_VCap_Androgen_notControl,],
+                                  VCapControl1[index_VCap_Androgen_notControl,], VCapControl2[index_VCap_Androgen_notControl,],
+                                  index_VCap_Androgen_notControl)
+
+#Not for LNCap as this doesn't variates enough to measure the difference.
+
+VCapAndrogen1_genesTF_passed <- VCapAndrogen1[ind_acf_ftest_VCap,]
+VCapAndrogen2_genesTF_passed <- VCapAndrogen2[ind_acf_ftest_VCap,]
+VCapControl1_genesTF_passed <- VCapControl1[ind_acf_ftest_VCap,]
+VCapControl2_genesTF_passed <- VCapControl2[ind_acf_ftest_VCap,]
+
+#from the probe file - contains ProbeType, VCapProbID, VCapSymbol, etc..
+VCapProbes_genesTF_passed <- probes[ind_acf_ftest_VCap,c(1,2,3)]
+
+#"hgnc_symbol-illumina_probe"
+rownames(VCapAndrogen1_genesTF_passed) <- rownames(VCapAndrogen2_genesTF_passed) <- paste(VCapProbes_genesTF_passed[,2], VCapProbes_genesTF_passed[,3], sep=".")
+
+```
+Select only the Transcription Factors
+
+```{r}
+#Check if any of the genes selcted until now are transcription factors
+# Script of this is in /media/bo01/     or    /Volumes/Valeria/CRUK/Human_TFs
+tfs_vcap <- get(load("/Volumes/Valeria/CRUK/Human_TFs/AnnotationVCap_TFs.RData"))[,c(1,11,12,13,16)]
+
+#no need for toupper as they already are all upper case.
+ind_tfs_VCap <- which(as.character(VCapProbes_genesTF_passed$VCap.Probe_id)%in%as.character(tfs_vcap$IlluminaID))
+
+VCapAndrogen1_passed <- VCapAndrogen1_genesTF_passed[ind_tfs_VCap,]
+VCapAndrogen2_passed <- VCapAndrogen2_genesTF_passed[ind_tfs_VCap,]
+VCapControl1_passed <- VCapControl1_genesTF_passed[ind_tfs_VCap,]
+VCapControl2_passed <- VCapControl2_genesTF_passed[ind_tfs_VCap,]
+
+#from the probe file - contains ProbeType, VCapProbID, VCapSymbol, etc..
+VCapProbes_passed <- VCapProbes_genesTF_passed[ind_tfs_VCap,]
+
+rownames(VCapAndrogen1_passed) <- rownames(VCapAndrogen2_passed) <- paste(VCapProbes_passed[,2], VCapProbes_passed[,3], sep=".")
+
+# Ensembl_id_correspondence
+tfs_vcap_in <- tfs_vcap[tfs_vcap$IlluminaID%in%as.character(VCapProbes_passed$VCap.Probe_id),]
+ordered_tfs <- tfs_vcap_in[order(match(tfs_vcap_in$IlluminaID,VCapProbes_passed$VCap.Probe_id)),]
+rm(tfs_vcap_in)
+
+```
+Calculate the time point of change.
+Calculate where the behaviour of the gene change.
+The repetitions have different time points therefore I cannot calculate the mean.
+I need to operate on each matrix separately.
+Calculate slope (y2-y1)/(x2-x1)
+
+```{r functions time point}
+subtract_columns_matrix <- function(Matrix){  
+  Matrix_next <- Matrix[,-1]
+  Matrix_now <- Matrix[,-ncol(Matrix)]
+  Matrix_sub <- Matrix_next - Matrix_now
+  return(Matrix_sub)
+}
+
+subtract_elements_array <- function(Array){  
+  Array_next <- Array[-1]
+  Array_now <- Array[-length(Array)]
+  Array_sub <- Array_next - Array_now
+  return(Array_sub)
+}
+
+divide_row_array <- function(Matrix, Array){
+  Matrix_div <- round(Matrix[i,]/Array,digits=1)
+  return(Matrix_div)
+}
+
+mean_each2 <- function(Array){
+  Array_next <- Array[-1]
+  Array_now <- Array[-length(Array)]
+  Array_mean <- round(rowMeans(cbind(Array_next, Array_now), na.rm=TRUE), digits=2)
+  return(Array_mean)
+}
+
+time_Androgen <- time_VCapAndrogen1
+time_Control <- intersect(time_VCapControl1,time_VCapControl2)
+
+```
+
+
+
+<!-- ## Including Plots -->
+
+<!-- You can also embed plots, for example: -->
+
+<!-- ```{r pressure, echo=FALSE} -->
+<!-- plot(pressure) -->
+<!-- ``` -->
+
+<!-- Note that the `echo = FALSE` parameter was added to the code chunk to prevent printing of the R code that generated the plot. -->
